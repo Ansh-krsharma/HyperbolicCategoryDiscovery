@@ -1,7 +1,7 @@
-import math
 import random
 import numpy as np
 from dataclasses import dataclass
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ from torchvision import datasets, transforms, models
 
 from sklearn.cluster import KMeans
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from sklearn.manifold import TSNE
 from scipy.optimize import linear_sum_assignment
 
 
@@ -22,7 +23,6 @@ class Config:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Dataset split: known vs unknown classes
     known_classes: tuple = (0, 1, 2, 3, 4)
     unknown_classes: tuple = (5, 6, 7, 8, 9)
     num_total_classes: int = 10
@@ -46,9 +46,10 @@ class Config:
     lambda_hyp: float = 1.0
     lambda_pseudo: float = 0.5
 
-    # Quick demo mode
     train_subset: int = 10000
     test_subset: int = 3000
+
+    save_dir: str = "./outputs"
 
 
 cfg = Config()
@@ -71,11 +72,6 @@ set_seed(cfg.seed)
 # 3. HYPERBOLIC OPS
 # =========================
 EPS = 1e-6
-
-
-def artanh(x: torch.Tensor) -> torch.Tensor:
-    x = torch.clamp(x, -1 + EPS, 1 - EPS)
-    return 0.5 * torch.log((1 + x) / (1 - x))
 
 
 class AdaptiveCurvature(nn.Module):
@@ -123,34 +119,48 @@ def pairwise_poincare_distance(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor
 
 
 # =========================
-# 4. DATASET
+# 4. DATASET WITH BETTER AUGMENTATION
 # =========================
 class CIFAR10GCD(Dataset):
     """
     Returns:
         img1, img2, label, is_labeled, index
-    img1/img2 are two augmented views of the same sample.
     """
     def __init__(self, train=True, subset_size=None):
         self.train = train
 
+        # Better augmentation added here
         self.transform1 = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.8, 1.0)),
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.6, 1.0)),
             transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
             transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
         ])
 
         self.transform2 = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.8, 1.0)),
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.6, 1.0)),
             transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
             transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
         ])
 
         self.base_transform = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
             transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
         ])
 
         self.dataset = datasets.CIFAR10(root="./data", train=train, download=True)
@@ -211,11 +221,9 @@ class ImprovedHypCD(nn.Module):
         feats2, z_euc2, z_hyp2, logits2, _ = self.encode(x2)
 
         return {
-            "feats1": feats1,
             "z_euc1": z_euc1,
             "z_hyp1": z_hyp1,
             "logits1": logits1,
-            "feats2": feats2,
             "z_euc2": z_euc2,
             "z_hyp2": z_hyp2,
             "logits2": logits2,
@@ -233,9 +241,6 @@ def supervised_loss(logits, labels, is_labeled):
 
 
 def supervised_contrastive_loss(features, labels, temperature=0.2):
-    """
-    features: [B, D], labels: [B]
-    """
     device = features.device
     features = F.normalize(features, dim=1)
     sim = torch.matmul(features, features.T) / temperature
@@ -363,7 +368,52 @@ def evaluate_clustering(model, loader, device):
 
 
 # =========================
-# 9. TRAINING
+# 9. PLOTS
+# =========================
+def plot_training_curves(history):
+    epochs = range(1, len(history["loss"]) + 1)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history["loss"], label="Train Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history["test_acc"], label="Test ACC")
+    plt.plot(epochs, history["test_nmi"], label="Test NMI")
+    plt.plot(epochs, history["test_ari"], label="Test ARI")
+    plt.xlabel("Epoch")
+    plt.ylabel("Metric")
+    plt.title("Test Metrics")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_tsne(model, loader, device, title="t-SNE of Learned Embeddings"):
+    features, labels, _ = extract_embeddings(model, loader, device)
+
+    tsne = TSNE(n_components=2, random_state=cfg.seed, perplexity=30)
+    reduced = tsne.fit_transform(features)
+
+    plt.figure(figsize=(8, 6))
+    scatter = plt.scatter(reduced[:, 0], reduced[:, 1], c=labels, cmap="tab10", s=10)
+    plt.title(title)
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.colorbar(scatter)
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# 10. TRAINING
 # =========================
 def train():
     device = cfg.device
@@ -409,11 +459,17 @@ def train():
 
     pseudo_label_dict = None
 
+    history = {
+        "loss": [],
+        "test_acc": [],
+        "test_nmi": [],
+        "test_ari": [],
+    }
+
     for epoch in range(cfg.epochs):
         model.train()
         total_loss_meter = 0.0
 
-        # build pseudo-labels after warmup
         if epoch >= cfg.pseudo_start_epoch:
             pseudo_label_dict, _, _ = build_pseudo_label_dict(model, eval_train_loader, device)
             print(f"\n[Epoch {epoch+1}] Pseudo labels updated.")
@@ -427,14 +483,11 @@ def train():
 
             out = model(x1, x2)
 
-            # classification on labeled samples
             cls_loss = supervised_loss(out["logits1"], y, is_labeled)
 
-            # create training labels for contrastive part
             contrast_labels = y.clone()
-
-            # apply pseudo-labels to confident unlabeled samples
             pseudo_mask = torch.zeros_like(is_labeled, dtype=torch.bool, device=device)
+
             if pseudo_label_dict is not None:
                 for b in range(len(idx)):
                     sample_idx = int(idx[b])
@@ -443,7 +496,6 @@ def train():
                         contrast_labels[b] = pseudo_lbl
                         pseudo_mask[b] = True
 
-            # known labels + confident pseudo labels
             usable_mask = is_labeled | pseudo_mask
 
             if usable_mask.sum() > 1:
@@ -457,7 +509,6 @@ def train():
                 euc_loss = torch.tensor(0.0, device=device)
                 hyp_loss = torch.tensor(0.0, device=device)
 
-            # small pseudo classification regularization
             if pseudo_mask.sum() > 0:
                 pseudo_cls_loss = F.cross_entropy(out["logits1"][pseudo_mask], contrast_labels[pseudo_mask])
             else:
@@ -479,18 +530,27 @@ def train():
         avg_loss = total_loss_meter / len(train_loader)
         curvature_value = model.curvature().item()
 
-        train_acc, train_nmi, train_ari = evaluate_clustering(model, eval_train_loader, device)
         test_acc, test_nmi, test_ari = evaluate_clustering(model, test_loader, device)
+
+        history["loss"].append(avg_loss)
+        history["test_acc"].append(test_acc)
+        history["test_nmi"].append(test_nmi)
+        history["test_ari"].append(test_ari)
 
         print(
             f"\nEpoch [{epoch+1}/{cfg.epochs}] "
             f"Loss={avg_loss:.4f} "
             f"Curvature={curvature_value:.4f}"
         )
-        print(f"Train: ACC={train_acc:.4f} NMI={train_nmi:.4f} ARI={train_ari:.4f}")
         print(f"Test : ACC={test_acc:.4f} NMI={test_nmi:.4f} ARI={test_ari:.4f}")
 
     print("\nTraining complete.")
+
+    # 1. Loss/metric plots
+    plot_training_curves(history)
+
+    # 2. t-SNE visualization
+    plot_tsne(model, test_loader, device, title="t-SNE of Improved HypCD Embeddings")
 
 
 if __name__ == "__main__":
