@@ -15,9 +15,9 @@ from sklearn.manifold import TSNE
 from scipy.optimize import linear_sum_assignment
 
 
-# =========================
-# 1. CONFIG
-# =========================
+# =========================================================
+# 1. CONFIGURATION
+# =========================================================
 @dataclass
 class Config:
     seed: int = 42
@@ -37,7 +37,7 @@ class Config:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     epochs: int = 15
-    pseudo_start_epoch: int = 6
+    pseudo_start_epoch: int = 5
     pseudo_conf_threshold: float = 0.55
 
     temperature: float = 0.2
@@ -55,9 +55,9 @@ class Config:
 cfg = Config()
 
 
-# =========================
+# =========================================================
 # 2. REPRODUCIBILITY
-# =========================
+# =========================================================
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -68,13 +68,17 @@ def set_seed(seed: int):
 set_seed(cfg.seed)
 
 
-# =========================
-# 3. HYPERBOLIC OPS
-# =========================
+# =========================================================
+# 3. HYPERBOLIC OPERATIONS
+# =========================================================
 EPS = 1e-6
 
 
 class AdaptiveCurvature(nn.Module):
+    """
+    Learnable curvature:
+        c = softplus(theta)
+    """
     def __init__(self, init_c: float = 1.0):
         super().__init__()
         self.raw_c = nn.Parameter(torch.tensor([init_c], dtype=torch.float32))
@@ -92,6 +96,9 @@ def project_to_ball(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
 
 
 def expmap0(u: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """
+    Exponential map at origin to Poincare ball
+    """
     sqrt_c = torch.sqrt(c)
     u_norm = torch.norm(u, dim=-1, keepdim=True).clamp_min(EPS)
     gamma = torch.tanh(sqrt_c * u_norm) * u / (sqrt_c * u_norm)
@@ -99,6 +106,9 @@ def expmap0(u: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
 
 
 def poincare_distance(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """
+    Hyperbolic distance in the Poincare ball
+    """
     x2 = torch.sum(x * x, dim=-1, keepdim=True)
     y2 = torch.sum(y * y, dim=-1, keepdim=True)
     diff2 = torch.sum((x - y) ** 2, dim=-1, keepdim=True)
@@ -118,9 +128,9 @@ def pairwise_poincare_distance(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor
     return d
 
 
-# =========================
-# 4. DATASET WITH BETTER AUGMENTATION
-# =========================
+# =========================================================
+# 4. DATASET
+# =========================================================
 class CIFAR10GCD(Dataset):
     """
     Returns:
@@ -129,7 +139,6 @@ class CIFAR10GCD(Dataset):
     def __init__(self, train=True, subset_size=None):
         self.train = train
 
-        # Better augmentation added here
         self.transform1 = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.6, 1.0)),
@@ -167,6 +176,7 @@ class CIFAR10GCD(Dataset):
 
         indices = list(range(len(self.dataset)))
         random.shuffle(indices)
+
         if subset_size is not None:
             indices = indices[:subset_size]
 
@@ -186,9 +196,9 @@ class CIFAR10GCD(Dataset):
         return img1, img2, torch.tensor(label), torch.tensor(is_labeled), torch.tensor(idx)
 
 
-# =========================
+# =========================================================
 # 5. MODEL
-# =========================
+# =========================================================
 class ImprovedHypCD(nn.Module):
     def __init__(self, emb_dim=128, num_classes=10):
         super().__init__()
@@ -211,9 +221,11 @@ class ImprovedHypCD(nn.Module):
         feats = self.backbone(x)
         z_euc = self.projector(feats)
         z_euc = F.normalize(z_euc, dim=-1)
+
         c = self.curvature()
         z_hyp = expmap0(z_euc, c)
         logits = self.classifier(z_euc)
+
         return feats, z_euc, z_hyp, logits, c
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor):
@@ -231,9 +243,9 @@ class ImprovedHypCD(nn.Module):
         }
 
 
-# =========================
+# =========================================================
 # 6. LOSSES
-# =========================
+# =========================================================
 def supervised_loss(logits, labels, is_labeled):
     if is_labeled.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
@@ -288,9 +300,9 @@ def hyperbolic_contrastive_loss(z_hyp, labels, c, temperature=0.2):
     return -mean_log_prob_pos[valid_rows].mean()
 
 
-# =========================
-# 7. PSEUDO LABELING
-# =========================
+# =========================================================
+# 7. PSEUDO LABEL REFINEMENT
+# =========================================================
 @torch.no_grad()
 def extract_embeddings(model, loader, device):
     model.eval()
@@ -338,18 +350,20 @@ def build_pseudo_label_dict(model, loader, device):
             pseudo_dict[i] = (int(labels[i]), 1.0, True)
         else:
             pseudo_dict[i] = (int(pred[i]), float(conf[i]), False)
+
     return pseudo_dict, pred, labels
 
 
-# =========================
+# =========================================================
 # 8. METRICS
-# =========================
+# =========================================================
 def clustering_accuracy(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=np.int64)
     y_pred = np.asarray(y_pred, dtype=np.int64)
 
     D = max(y_pred.max(), y_true.max()) + 1
     w = np.zeros((D, D), dtype=np.int64)
+
     for yp, yt in zip(y_pred, y_true):
         w[yp, yt] += 1
 
@@ -367,29 +381,28 @@ def evaluate_clustering(model, loader, device):
     return acc, nmi, ari
 
 
-# =========================
-# 9. PLOTS
-# =========================
+# =========================================================
+# 9. VISUALIZATION
+# =========================================================
 def plot_training_curves(history):
     epochs = range(1, len(history["loss"]) + 1)
 
     plt.figure(figsize=(8, 5))
-    plt.plot(epochs, history["loss"], label="Train Loss")
+    plt.plot(epochs, history["loss"], marker='o')
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title("Training Loss")
-    plt.legend()
+    plt.title("Training Loss Curve")
     plt.grid(True)
     plt.tight_layout()
     plt.show()
 
     plt.figure(figsize=(8, 5))
-    plt.plot(epochs, history["test_acc"], label="Test ACC")
-    plt.plot(epochs, history["test_nmi"], label="Test NMI")
-    plt.plot(epochs, history["test_ari"], label="Test ARI")
+    plt.plot(epochs, history["test_acc"], marker='o', label="ACC")
+    plt.plot(epochs, history["test_nmi"], marker='o', label="NMI")
+    plt.plot(epochs, history["test_ari"], marker='o', label="ARI")
     plt.xlabel("Epoch")
-    plt.ylabel("Metric")
-    plt.title("Test Metrics")
+    plt.ylabel("Metric Score")
+    plt.title("Clustering Metrics")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
@@ -403,18 +416,17 @@ def plot_tsne(model, loader, device, title="t-SNE of Learned Embeddings"):
     reduced = tsne.fit_transform(features)
 
     plt.figure(figsize=(8, 6))
-    scatter = plt.scatter(reduced[:, 0], reduced[:, 1], c=labels, cmap="tab10", s=10)
+    plt.scatter(reduced[:, 0], reduced[:, 1], c=labels, cmap="tab10", s=10)
     plt.title(title)
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
-    plt.colorbar(scatter)
     plt.tight_layout()
     plt.show()
 
 
-# =========================
+# =========================================================
 # 10. TRAINING
-# =========================
+# =========================================================
 def train():
     device = cfg.device
     print("Using device:", device)
@@ -470,9 +482,10 @@ def train():
         model.train()
         total_loss_meter = 0.0
 
+        # Pseudo-label update
         if epoch >= cfg.pseudo_start_epoch:
             pseudo_label_dict, _, _ = build_pseudo_label_dict(model, eval_train_loader, device)
-            print(f"\n[Epoch {epoch+1}] Pseudo labels updated.")
+            print(f"\n[Epoch {epoch+1}] Pseudo-labels updated.")
 
         for x1, x2, y, is_labeled, idx in train_loader:
             x1 = x1.to(device)
@@ -483,8 +496,10 @@ def train():
 
             out = model(x1, x2)
 
+            # Supervised classification loss
             cls_loss = supervised_loss(out["logits1"], y, is_labeled)
 
+            # Prepare labels for contrastive learning
             contrast_labels = y.clone()
             pseudo_mask = torch.zeros_like(is_labeled, dtype=torch.bool, device=device)
 
@@ -546,12 +561,13 @@ def train():
 
     print("\nTraining complete.")
 
-    # 1. Loss/metric plots
+    # Plot results
     plot_training_curves(history)
-
-    # 2. t-SNE visualization
     plot_tsne(model, test_loader, device, title="t-SNE of Improved HypCD Embeddings")
 
 
+# =========================================================
+# 11. MAIN
+# =========================================================
 if __name__ == "__main__":
     train()
